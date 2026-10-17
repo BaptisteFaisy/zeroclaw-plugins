@@ -285,6 +285,21 @@ mod component {
             },
         );
     }
+    fn report_poll_failure(error: &str) {
+        let report = with_state(|state| {
+            state.session.sync_failed = true;
+            if state.retry_at.is_some_and(|at| Instant::now() < at) {
+                return false;
+            }
+            state.retry_at = Some(Instant::now() + Duration::from_secs(state.retry_secs));
+            state.retry_secs = (state.retry_secs * 2).min(30);
+            true
+        })
+        .unwrap_or(true);
+        if report {
+            report_failure("poll", error);
+        }
+    }
     fn to_wit(message: Inbound) -> InboundMessage {
         InboundMessage {
             id: message.id,
@@ -300,6 +315,26 @@ mod component {
             subject: None,
         }
     }
+    fn next_unencrypted(
+        cfg: &MatrixConfig,
+        token: &str,
+        budget: &mut Budget,
+    ) -> Result<Option<InboundMessage>, String> {
+        with_state(|state| {
+            state.session.next_unencrypted(cfg, |room| {
+                let (status, bytes) = http::request(
+                    Method::Get,
+                    &matrix::encryption_url(cfg.homeserver(), room),
+                    token,
+                    None,
+                    16 * 1024,
+                    budget,
+                )?;
+                matrix::encryption_absent(status, &bytes)
+            })
+        })?
+        .map(|message| message.map(to_wit))
+    }
     fn poll() -> Result<Option<InboundMessage>, String> {
         let mut budget = Budget::new(25);
         let (cfg, token) = current()?;
@@ -307,8 +342,8 @@ mod component {
             return Ok(None);
         }
         authenticate(&cfg, &token, &mut budget)?;
-        if let Some(message) = with_state(|state| state.session.next(&cfg))? {
-            return Ok(Some(to_wit(message)));
+        if with_state(|state| !state.session.pending.is_empty() && !state.session.sync_failed)? {
+            return next_unencrypted(&cfg, &token, &mut budget);
         }
         let since = with_state(|state| state.session.since.clone())?;
         let value = json_get(
@@ -317,12 +352,22 @@ mod component {
             MAX_BODY,
             &mut budget,
         )?;
+        if let Err(error) = with_state(|state| state.session.ingest(&value, &cfg))? {
+            if error == matrix::SYNC_QUEUE_LIMIT_ERROR
+                && with_state(|state| !state.session.pending.is_empty())?
+            {
+                // Failed refresh retains the cursor; admitted delivery can free queue capacity.
+                report_poll_failure(&error);
+                return next_unencrypted(&cfg, &token, &mut budget);
+            }
+            return Err(error);
+        }
+        let message = next_unencrypted(&cfg, &token, &mut budget)?;
         with_state(|state| {
-            state.session.ingest(&value, &cfg)?;
             state.retry_at = None;
             state.retry_secs = 1;
-            Ok(state.session.next(&cfg).map(to_wit))
-        })?
+        })?;
+        Ok(message)
     }
 
     struct MatrixChannel;
@@ -423,20 +468,7 @@ mod component {
             match poll() {
                 Ok(message) => message,
                 Err(error) => {
-                    let report = with_state(|state| {
-                        state.session.sync_failed = true;
-                        if state.retry_at.is_some_and(|at| Instant::now() < at) {
-                            return false;
-                        }
-                        state.retry_at =
-                            Some(Instant::now() + Duration::from_secs(state.retry_secs));
-                        state.retry_secs = (state.retry_secs * 2).min(30);
-                        true
-                    })
-                    .unwrap_or(true);
-                    if report {
-                        report_failure("poll", &error);
-                    }
+                    report_poll_failure(&error);
                     None
                 }
             }

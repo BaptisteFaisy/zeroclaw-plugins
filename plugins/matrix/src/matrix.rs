@@ -8,6 +8,7 @@ use std::collections::{HashMap, VecDeque};
 pub const CHANNEL: &str = "matrix";
 pub const MAX_BODY: usize = 512 * 1024;
 pub const MAX_PENDING: usize = 64;
+pub const SYNC_QUEUE_LIMIT_ERROR: &str = "matrix: sync queue limit exceeded";
 pub const MAX_ROOM_METADATA: usize = 256;
 pub const MAX_TEXT: usize = 64 * 1024;
 const MAX_ID: usize = 255;
@@ -155,15 +156,21 @@ pub fn parse_room_id(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Only an authenticated response from the exact encryption-state endpoint qualifies.
+/// Only call with an authenticated response from the exact encryption-state endpoint.
+pub fn encryption_absent(status: u16, body: &[u8]) -> Result<bool, String> {
+    let value = serde_json::from_slice::<Value>(body)
+        .map_err(|_| "matrix: encryption state uncertain; inbound refused")?;
+    if status == 404 && value.get("errcode").and_then(Value::as_str) == Some("M_NOT_FOUND") {
+        Ok(true)
+    } else if status == 200 && value.is_object() {
+        Ok(false)
+    } else {
+        Err("matrix: encryption state uncertain; inbound refused".into())
+    }
+}
+
 pub fn require_unencrypted(status: u16, body: &[u8]) -> Result<(), String> {
-    if status == 404
-        && serde_json::from_slice::<Value>(body)
-            .ok()
-            .is_some_and(|value| {
-                value.get("errcode").and_then(Value::as_str) == Some("M_NOT_FOUND")
-            })
-    {
+    if encryption_absent(status, body) == Ok(true) {
         Ok(())
     } else {
         Err("matrix: encryption state present or uncertain; send refused".into())
@@ -197,11 +204,13 @@ pub struct Pending {
     mentioned: bool,
 }
 impl Pending {
-    pub fn deliver(mut self, cfg: &MatrixConfig, self_id: &str) -> Option<Inbound> {
-        if self.message.sender == self_id
-            || !cfg.room_allowed(&self.message.reply_target)
-            || (cfg.mention_only && !self.direct && !self.mentioned)
-        {
+    fn allowed(&self, cfg: &MatrixConfig, self_id: &str) -> bool {
+        self.message.sender != self_id
+            && cfg.room_allowed(&self.message.reply_target)
+            && (!cfg.mention_only || self.direct || self.mentioned)
+    }
+    fn deliver(mut self, cfg: &MatrixConfig, self_id: &str) -> Option<Inbound> {
+        if !self.allowed(cfg, self_id) {
             return None;
         }
         self.message.thread_ts = self
@@ -345,7 +354,7 @@ fn parse_sync(
                 for event in events {
                     if let Some(message) = parse_event(room_id, event, self_id, direct) {
                         if pending.len() == MAX_PENDING {
-                            return Err("matrix: sync queue limit exceeded".into());
+                            return Err(SYNC_QUEUE_LIMIT_ERROR.into());
                         }
                         pending.push_back(message);
                     }
@@ -485,16 +494,30 @@ impl Session {
             }
         }
     }
-    pub fn next(&mut self, cfg: &MatrixConfig) -> Option<Inbound> {
+    pub fn next_unencrypted(
+        &mut self,
+        cfg: &MatrixConfig,
+        check: impl FnOnce(&str) -> Result<bool, String>,
+    ) -> Result<Option<Inbound>, String> {
         if self.invalidated {
-            return None;
+            return Ok(None);
         }
         while let Some(pending) = self.pending.pop_front() {
-            if let Some(message) = pending.deliver(cfg, &self.self_id) {
-                return Some(message);
+            if !pending.allowed(cfg, &self.self_id) {
+                continue;
             }
+            // One lookup per poll keeps encrypted queues within the shared HTTP budget.
+            return match check(&pending.message.reply_target) {
+                Ok(true) => Ok(pending.deliver(cfg, &self.self_id)),
+                Ok(false) => Ok(None),
+                Err(error) => {
+                    // Keep retryable work without pinning other rooms behind this candidate.
+                    self.pending.push_back(pending);
+                    Err(error)
+                }
+            };
         }
-        None
+        Ok(None)
     }
     pub fn healthy(&self) -> bool {
         !self.invalidated && !self.bootstrapping && !self.sync_failed && self.since.is_some()

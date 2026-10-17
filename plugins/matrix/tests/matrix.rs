@@ -1,7 +1,7 @@
 use matrix::matrix::{
-    build_send_body, encryption_url, matrix_id, parse_cursor, parse_room_id, parse_whoami,
-    require_unencrypted, send_url, sync_url, whoami_url, Inbound, MatrixConfig, Session,
-    MAX_PENDING, MAX_ROOM_METADATA,
+    build_send_body, encryption_absent, encryption_url, matrix_id, parse_cursor, parse_room_id,
+    parse_whoami, require_unencrypted, send_url, sync_url, whoami_url, Inbound, MatrixConfig,
+    Session, MAX_PENDING, MAX_ROOM_METADATA, SYNC_QUEUE_LIMIT_ERROR,
 };
 use serde_json::{json, Value};
 
@@ -22,13 +22,20 @@ fn finish_bootstrap(state: &mut Session, cfg: &MatrixConfig) {
     state.ingest(&json!({"next_batch":cursor}), cfg).unwrap();
     assert!(state.healthy());
 }
+fn next_unencrypted(state: &mut Session, cfg: &MatrixConfig) -> Option<Inbound> {
+    state
+        .next_unencrypted(cfg, |_| {
+            encryption_absent(404, br#"{"errcode":"M_NOT_FOUND"}"#)
+        })
+        .unwrap()
+}
 fn messages(value: &Value, cfg: &MatrixConfig) -> Vec<Inbound> {
     let mut state = Session::new(cfg, SELF.into());
     state.ingest(&json!({"next_batch":"start"}), cfg).unwrap();
     finish_bootstrap(&mut state, cfg);
     state.ingest(value, cfg).unwrap();
     let mut messages = Vec::new();
-    while let Some(message) = state.next(cfg) {
+    while let Some(message) = next_unencrypted(&mut state, cfg) {
         messages.push(message);
     }
     messages
@@ -126,6 +133,10 @@ fn urls_encode_room_alias_and_cursor_segments() {
 #[test]
 fn encryption_preflight_admits_only_endpoint_specific_authenticated_absence() {
     assert!(require_unencrypted(404, br#"{"errcode":"M_NOT_FOUND"}"#).is_ok());
+    assert_eq!(
+        encryption_absent(404, br#"{"errcode":"M_NOT_FOUND"}"#),
+        Ok(true)
+    );
     for (status, body) in [
         (200, br#"{"algorithm":"m.megolm.v1.aes-sha2"}"#.as_slice()),
         (200, br#"{"algorithm":"unknown"}"#.as_slice()),
@@ -143,7 +154,223 @@ fn encryption_preflight_admits_only_endpoint_specific_authenticated_absence() {
             require_unencrypted(status, body).is_err(),
             "status {status}"
         );
+        if status == 200 && serde_json::from_slice::<Value>(body).is_ok() {
+            assert_eq!(encryption_absent(status, body), Ok(false));
+        } else {
+            assert!(encryption_absent(status, body).is_err());
+        }
     }
+    for body in [b"null".as_slice(), b"[]", b"true", b"\"text\""] {
+        assert!(encryption_absent(200, body).is_err());
+    }
+}
+
+#[test]
+fn inbound_encryption_admission_discards_normally_and_rechecks_queued_messages() {
+    let config = cfg();
+    let mut state = Session::new(&config, SELF.into());
+    state
+        .ingest(&json!({"next_batch":"start"}), &config)
+        .unwrap();
+    finish_bootstrap(&mut state, &config);
+    state
+        .ingest(
+            &sync(vec![
+                text(
+                    "$encrypted",
+                    "@user:example",
+                    json!({"msgtype":"m.text","body":"blocked"}),
+                ),
+                text(
+                    "$plain",
+                    "@user:example",
+                    json!({"msgtype":"m.text","body":"allowed"}),
+                ),
+            ]),
+            &config,
+        )
+        .unwrap();
+    assert!(state
+        .next_unencrypted(&config, |room| {
+            assert_eq!(room, "!room:example");
+            encryption_absent(200, br#"{}"#)
+        })
+        .unwrap()
+        .is_none());
+    assert!(state.healthy());
+    assert_eq!(state.pending.len(), 1);
+    assert_eq!(
+        state
+            .next_unencrypted(&config, |room| {
+                assert_eq!(room, "!room:example");
+                encryption_absent(404, br#"{"errcode":"M_NOT_FOUND"}"#)
+            })
+            .unwrap()
+            .unwrap()
+            .id,
+        "$plain"
+    );
+    assert!(state.pending.is_empty());
+}
+
+#[test]
+fn uncertain_inbound_encryption_preserves_and_rotates_the_candidate() {
+    let mut config = cfg();
+    let mut state = Session::new(&config, SELF.into());
+    state
+        .ingest(&json!({"next_batch":"start"}), &config)
+        .unwrap();
+    finish_bootstrap(&mut state, &config);
+    let mut batch = sync(vec![text(
+        "$uncertain",
+        "@user:example",
+        json!({"msgtype":"m.text","body":"retry"}),
+    )]);
+    batch["rooms"]["join"]["!zplain:example"] = json!({"timeline":{"events":[
+        text("$plain", "@user:example", json!({"msgtype":"m.text","body":"allowed"}))]}});
+    state.ingest(&batch, &config).unwrap();
+    assert!(state
+        .next_unencrypted(&config, |room| {
+            assert_eq!(room, "!room:example");
+            Err("matrix: HTTP deadline exceeded".into())
+        })
+        .is_err());
+    assert_eq!(state.pending.len(), 2);
+    assert_eq!(
+        state
+            .next_unencrypted(&config, |room| {
+                assert_eq!(room, "!zplain:example");
+                Ok(true)
+            })
+            .unwrap()
+            .unwrap()
+            .id,
+        "$plain"
+    );
+    assert_eq!(
+        state
+            .next_unencrypted(&config, |room| {
+                assert_eq!(room, "!room:example");
+                encryption_absent(404, br#"{"errcode":"M_NOT_FOUND"}"#)
+            })
+            .unwrap()
+            .unwrap()
+            .id,
+        "$uncertain"
+    );
+
+    state.ingest(&batch, &config).unwrap();
+    assert!(state
+        .next_unencrypted(&config, |_| encryption_absent(403, br#"{}"#))
+        .is_err());
+    config.allowed_rooms = vec!["!else:example".into()];
+    assert!(state
+        .next_unencrypted(&config, |_| panic!("current room policy must run first"))
+        .unwrap()
+        .is_none());
+    assert!(state.pending.is_empty());
+}
+
+#[test]
+fn failed_encryption_candidate_survives_resync_and_allows_new_room_delivery() {
+    let config = cfg();
+    let mut state = Session::new(&config, SELF.into());
+    state
+        .ingest(&json!({"next_batch":"start"}), &config)
+        .unwrap();
+    finish_bootstrap(&mut state, &config);
+    state
+        .ingest(
+            &sync(vec![text(
+                "$uncertain",
+                "@user:example",
+                json!({"msgtype":"m.text","body":"retry"}),
+            )]),
+            &config,
+        )
+        .unwrap();
+    assert!(state
+        .next_unencrypted(&config, |_| encryption_absent(500, b""))
+        .is_err());
+    // The export records the failure, then retries sync with the retained queue.
+    state.sync_failed = true;
+    state.ingest(&json!({"next_batch":"s3", "rooms":{"join":{"!new:example":{
+        "timeline":{"events":[text("$new", "@user:example", json!({"msgtype":"m.text","body":"fresh"}))]}
+    }}}}), &config).unwrap();
+    assert_eq!(state.pending.len(), 2);
+    assert!(state
+        .next_unencrypted(&config, |room| {
+            assert_eq!(room, "!room:example");
+            encryption_absent(403, br#"{}"#)
+        })
+        .is_err());
+    assert_eq!(
+        state
+            .next_unencrypted(&config, |room| {
+                assert_eq!(room, "!new:example");
+                encryption_absent(404, br#"{"errcode":"M_NOT_FOUND"}"#)
+            })
+            .unwrap()
+            .unwrap()
+            .id,
+        "$new"
+    );
+    assert_eq!(state.pending.len(), 1);
+}
+
+#[test]
+fn rejected_refresh_can_free_one_retained_slot_without_advancing_the_cursor() {
+    let config = cfg();
+    let mut state = Session::new(&config, SELF.into());
+    state
+        .ingest(&json!({"next_batch":"start"}), &config)
+        .unwrap();
+    finish_bootstrap(&mut state, &config);
+    state
+        .ingest(
+            &sync(vec![
+                text(
+                    "$uncertain",
+                    "@user:example",
+                    json!({"msgtype":"m.text","body":"retry"}),
+                ),
+                text(
+                    "$plain",
+                    "@user:example",
+                    json!({"msgtype":"m.text","body":"allowed"}),
+                ),
+            ]),
+            &config,
+        )
+        .unwrap();
+    assert!(state
+        .next_unencrypted(&config, |_| encryption_absent(500, b""))
+        .is_err());
+    let mut refresh = sync(
+        (0..MAX_PENDING - 1)
+            .map(|i| {
+                text(
+                    &format!("$new{i}"),
+                    "@user:example",
+                    json!({"msgtype":"m.text","body":"fresh"}),
+                )
+            })
+            .collect(),
+    );
+    refresh["next_batch"] = json!("s3");
+    assert_eq!(
+        state.ingest(&refresh, &config),
+        Err(SYNC_QUEUE_LIMIT_ERROR.into())
+    );
+    assert_eq!(state.since.as_deref(), Some("s2"));
+    assert_eq!(state.pending.len(), 2);
+    assert!(!state.healthy());
+    assert_eq!(next_unencrypted(&mut state, &config).unwrap().id, "$plain");
+    assert!(!state.healthy());
+    assert_eq!(state.since.as_deref(), Some("s2"));
+    state.ingest(&refresh, &config).unwrap();
+    assert_eq!(state.since.as_deref(), Some("s3"));
+    assert_eq!(state.pending.len(), MAX_PENDING);
 }
 
 #[test]
@@ -233,12 +460,12 @@ fn queued_delivery_uses_current_room_mention_and_reply_policy() {
     state.ingest(&value, &config).unwrap();
     config.mention_only = true;
     config.reply_in_thread = false;
-    let delivered = state.next(&config).unwrap();
+    let delivered = next_unencrypted(&mut state, &config).unwrap();
     assert_eq!(delivered.id, "$mention");
     assert!(delivered.thread_ts.is_none());
     state.ingest(&value, &config).unwrap();
     config.allowed_rooms = vec!["!else:example".into()];
-    assert!(state.next(&config).is_none());
+    assert!(next_unencrypted(&mut state, &config).is_none());
 }
 
 #[test]
@@ -313,7 +540,7 @@ fn startup_suppresses_backlog_and_identity_probe_does_not_clear_sync_failure() {
         json!({"msgtype":"m.text","body":"old"}),
     )]);
     state.ingest(&value, &config).unwrap();
-    assert!(state.next(&config).is_none());
+    assert!(next_unencrypted(&mut state, &config).is_none());
     assert!(!state.healthy());
     finish_bootstrap(&mut state, &config);
     assert!(state.healthy());
@@ -341,7 +568,7 @@ fn cached_startup_catch_up_is_suppressed_until_unchanged_incremental_cursor() {
         state.ingest(&batch, &config).unwrap();
         assert_eq!(state.since.as_deref(), Some(cursor));
         assert!(!state.healthy());
-        assert!(state.next(&config).is_none());
+        assert!(next_unencrypted(&mut state, &config).is_none());
     }
     let prior = state.rooms.clone();
     for invalid in [
@@ -356,7 +583,7 @@ fn cached_startup_catch_up_is_suppressed_until_unchanged_incremental_cursor() {
         assert_eq!(state.since.as_deref(), Some("catch-up-two"));
         assert_eq!(state.rooms, prior);
         assert!(!state.healthy());
-        assert!(state.next(&config).is_none());
+        assert!(next_unencrypted(&mut state, &config).is_none());
     }
     let mut equality = sync(vec![text(
         "$boundary",
@@ -367,7 +594,7 @@ fn cached_startup_catch_up_is_suppressed_until_unchanged_incremental_cursor() {
     equality["rooms"]["join"]["!room:example"]["summary"]["m.joined_member_count"] = json!(2);
     state.ingest(&equality, &config).unwrap();
     assert!(state.healthy());
-    assert!(state.next(&config).is_none());
+    assert!(next_unencrypted(&mut state, &config).is_none());
     let mut fresh = sync(vec![text(
         "$fresh",
         "@user:example",
@@ -381,8 +608,11 @@ fn cached_startup_catch_up_is_suppressed_until_unchanged_incremental_cursor() {
     let mut mention_only = config.clone();
     mention_only.mention_only = true;
     state.ingest(&fresh, &mention_only).unwrap();
-    assert_eq!(state.next(&mention_only).unwrap().id, "$fresh");
-    assert!(state.next(&mention_only).is_none());
+    assert_eq!(
+        next_unencrypted(&mut state, &mention_only).unwrap().id,
+        "$fresh"
+    );
+    assert!(next_unencrypted(&mut state, &mention_only).is_none());
 }
 
 #[test]
@@ -470,12 +700,12 @@ fn startup_room_metadata_survives_omission_but_not_replacement_or_leave() {
             .unwrap()
             .remove("summary");
         state.ingest(&later, &config).unwrap();
-        assert_eq!(state.next(&config).unwrap().id, "$later");
+        assert_eq!(next_unencrypted(&mut state, &config).unwrap().id, "$later");
 
         // A present empty summary is a delta with no count change.
         later["rooms"]["join"]["!room:example"]["summary"] = json!({});
         state.ingest(&later, &config).unwrap();
-        assert!(state.next(&config).is_some());
+        assert!(next_unencrypted(&mut state, &config).is_some());
 
         let mut replacement = json!({"next_batch":"replacement"});
         if via_direct {
@@ -486,7 +716,7 @@ fn startup_room_metadata_survives_omission_but_not_replacement_or_leave() {
         }
         state.ingest(&replacement, &config).unwrap();
         state.ingest(&later, &config).unwrap();
-        assert!(state.next(&config).is_none());
+        assert!(next_unencrypted(&mut state, &config).is_none());
 
         state.ingest(&initial, &config).unwrap();
         state
@@ -497,7 +727,7 @@ fn startup_room_metadata_survives_omission_but_not_replacement_or_leave() {
             .unwrap();
         assert!(state.rooms.is_empty());
         state.ingest(&later, &config).unwrap();
-        assert!(state.next(&config).is_none());
+        assert!(next_unencrypted(&mut state, &config).is_none());
     }
 }
 
@@ -584,7 +814,7 @@ fn limited_and_malformed_batches_do_not_commit_cursor_queue_or_metadata() {
         assert_eq!(state.rooms, prior);
         assert!(!state.healthy());
     }
-    assert_eq!(state.next(&config).unwrap().id, "$queued");
+    assert_eq!(next_unencrypted(&mut state, &config).unwrap().id, "$queued");
     assert!(state.check_binding(&config, SELF).is_ok());
     assert!(!state.healthy());
 }

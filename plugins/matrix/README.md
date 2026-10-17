@@ -32,9 +32,13 @@ Operational calls resolve current public config and secrets, then authenticate b
 
 ## Deliberately unencrypted rooms only
 
+Before returning an inbound plaintext message to the host, every poll performs a fresh authenticated encryption-state GET for that candidate's room. Both freshly synced and queued messages use the same admission operation. Only the exact `404`/`M_NOT_FOUND` absence response permits delivery. A successful encryption-state object, including empty content or an unknown algorithm, discards that candidate normally and leaves later candidates for subsequent polls. This does not trigger failure backoff or mark the channel unhealthy.
+
+Uncertain state, including malformed responses, authentication denial and transport or deadline errors, refuses delivery through the existing poll-failure path. The candidate retains its room/mention provenance and moves to the queue tail for a later fresh check, allowing other rooms to progress after the existing bounded backoff. Current room and mention policy is reapplied before checking. Polls check at most one eligible candidate. After a failure, the next retry refreshes sync while preserving the pending queue so new messages and room departures can be admitted; ordinary queued delivery does not require another sync. If the refresh exceeds queue capacity, one retained candidate can still pass the same fresh admission check and free a slot. The failed refresh leaves its cursor uncommitted and retains its failure/backoff state. Other sync failures do not use this fallback. Backoff resets only after sync and candidate admission finish without error. No room-encryption permission is cached.
+
 Every send resolves a room alias first, if present, then performs a fresh authenticated GET of that resolved room's `m.room.encryption` state immediately before the text PUT. Any existing encryption event is refused, including empty content or an unknown algorithm. Only `404` with valid JSON `errcode = "M_NOT_FOUND"` from that exact endpoint establishes absence. Generic 404, malformed responses, authentication or access denial, redirect, network refusal and deadline failure stop before any send PUT. Unencrypted-room permission is never cached.
 
-This preflight is **not atomic**. Encryption may be enabled between the state GET and the send PUT. Use the plugin only in intentionally unencrypted rooms whose operators accept that race. Use native Matrix for encrypted messaging. A send transport failure can leave delivery uncertain; the plugin does not automatically retry sends.
+These preflights are **not atomic**. Encryption may be enabled after the state GET and before host admission or the send PUT. Use the plugin only in intentionally unencrypted rooms whose operators accept that race. Use native Matrix for encrypted messaging. A send transport failure can leave delivery uncertain; the plugin does not automatically retry sends.
 
 ## Bounds and validation
 

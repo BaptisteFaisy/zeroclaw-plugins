@@ -70,7 +70,7 @@ fmt
   matching tree. When `wit/next` exists, the same check compares it with
   ZeroClaw's `wit/v0` at `wit/NEXT_REF`, an unreleased host revision; the pin
   and the directory must be added and removed together.
-  The `wit/current` / `wit/CURRENT_REF` pair receives the same byte-equality check. It currently prepares Matrix for an intended host release, and does not by itself establish that a matching host artifact has shipped.
+  A `wit/current` / `wit/CURRENT_REF` pair, when present, receives the same byte-equality check. None exists while `wit/v0` is the newest host contract.
 - `components` uses bounded shards and validates every selected plugin with
   locked host tests, host Clippy, `wasm32-wasip2` Clippy, and a release WASM
   build. Tests and builds are always strict. A plugin changed by the current
@@ -83,7 +83,7 @@ fmt
   packages. Each plugin builds from a snapshot of the committed `wit/` tree;
   only a `registry = false` plugin's snapshot includes `wit/next`, so a plugin
   headed for the registry cannot bind the unreleased contract.
-  The shared current-contract consumer policy permits registry-enabled Matrix and Discord to retain `wit/current`; every other registry-enabled guest has that directory withheld. Source-only guests retain their staging access.
+  When a `wit/current` directory exists, the shared current-contract consumer policy decides which registry-enabled guests retain it; every other registry-enabled guest has that directory withheld. Source-only guests retain their staging access.
 - `package` merges the staged shard artifacts and performs a dry-run registry
   build. The staged directory identities must exactly match the existing shard
   matrix before packaging; missing, substituted, or unexpected components fail
@@ -101,7 +101,7 @@ fmt
   exact-set check rejects any file or digest not derived from newly added
   ledger identities.
 
-A change under `wit/current/`, to `wit/CURRENT_REF`, or to its shared policy in `tools/registry_contract.py` also forces full validation and selects only the current-contract consumers as release inputs, unioned with directly changed plugins. The planner and snapshot validator use that same consumer policy: Matrix and Discord. Adopting the current contract for another registry guest requires an explicit policy change; it cannot silently reuse an existing package identity. This does not alter the v0 fanout rule or relax the next-contract exclusion. Matrix's registry exclusion remains until proof against the selected downloaded host artifact and a separate publication decision.
+A change under `wit/current/`, to `wit/CURRENT_REF`, or to its shared policy in `tools/registry_contract.py` also forces full validation and selects only the current-contract consumers as release inputs, unioned with directly changed plugins. The planner and snapshot validator use that same consumer policy. Adopting a current contract for another registry guest requires an explicit policy change; it cannot silently reuse an existing package identity. This does not alter the v0 fanout rule or relax the next-contract exclusion.
 - The gate always runs, aggregates shard results into the GitHub step summary,
   and requires report identities and strictness to match that same shard matrix
   exactly. It fails if any required dependency failed or was cancelled.
@@ -164,6 +164,48 @@ terminated, so a stale `registry-publication/*` branch may be deleted after
 confirming that it is not used by an active publication run. A workflow-token
 push does not recursively start a run.
 
+### Retiring a published version
+
+`registry-retirements.json` is the reviewed ledger of published
+`<name>@<version>` identities withdrawn from the index, for example versions
+that no supported host can load. Each entry names the identity, the `sha256`
+of its published archive and a reason. Entries are kept in canonical
+name/version order.
+
+The ledger is append-only, and the history check enforces it: validation
+compares it with the base revision's ledger (an empty one when the base
+predates it). An entry may not be removed, and its name, version and `sha256`
+may not change; only its `reason` may be reworded. Every entry a change adds
+must name a version the base `registry.json` indexes, with that version's
+published `sha256`, so a typo or a never-published identity fails. A listed
+identity therefore stays reserved.
+
+Every registry builder call in validation and publication passes the ledger,
+and the builder refuses to run against a `registry.json` that has the ledger
+beside it unless the ledger is passed. The packaging dry run drops each listed
+entry from the generated `registry.json` when the entry's `sha256` matches, and
+fails if it does not. `--check-history` and `--check-publication` accept the
+removal of exactly the listed entries; any other removal still fails. A listed
+identity can never be indexed again: packaging refuses a staged plugin at that
+version, and `--check-metadata` and `--check-history` refuse a
+registry-enabled source manifest at that version. A `registry = false` source
+at a listed version is allowed and is never packaged.
+
+A ledger change merges like any source change, but only publication rewrites
+`registry.json`. Until the next publication run, the checked-in index may still
+hold a listed entry. `--check-history` reports it as a warning, which validation
+surfaces as an annotation because a publication run is due; the publication
+candidate must not contain it, so `--check-publication` fails if it does.
+Because the history check accepts a listed entry's removal, a change that
+deletes such an entry from `registry.json` by hand is tolerated: the result is
+exactly what publication produces. Any other hand edit fails, except a
+canonical metadata refresh from `--sync-metadata`. Changing the ledger forces
+full validation, so the dry run exercises it.
+
+Retirement removes index entries, never release assets. Hosts stop being
+offered a retired version; its asset URL and bytes stay unchanged on the
+`plugins` release.
+
 ## Fork security boundary
 
 A fork pull request can modify its copy of the validation workflow and may be
@@ -204,8 +246,10 @@ The following work is deliberately deferred until its trigger is true.
   revision. Do not weaken the drift comparison.
 - Before publication, a plugin change can be reverted normally. After an asset
   is published, never delete, overwrite, or reuse its version. Keep historical
-  assets and registry entries intact, revert host selection to a compatible
-  pinned version, and publish corrected bytes under a new version.
+  assets intact, revert host selection to a compatible pinned version, and
+  publish corrected bytes under a new version. Withdraw a broken version from
+  the index through `registry-retirements.json`; validation rejects any other
+  removal from `registry.json`.
 - If upload succeeds but the registry push races with newer source, let the
   newest main run reconcile it when that source still contains the version. If
   newer source reverted the version, its uploaded asset remains permanently
